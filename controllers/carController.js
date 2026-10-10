@@ -23,7 +23,8 @@ const getCarData = (body) => ({
   fuelType: body.fuelType,
   seats: body.seats,
   rating: body.rating,
-  mileageType: body.mileageType,
+  // mileageType: body.mileageType,
+  price: body.price,
   specifications: parseSpecifications(body.specifications),
 });
 

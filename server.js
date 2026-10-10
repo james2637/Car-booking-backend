@@ -4,6 +4,7 @@ import express from "express";
 import connectDB from "./config/mongodb.js";
 import connectCloudinary from "./config/cloudinary.js";
 import authRoutes from "./routes/authRoutes.js";
+import bookingRoutes from "./routes/bookingRoutes.js";
 import carRoutes from "./routes/carRoutes.js";
 import { errorHandler, notFound } from "./middleware/errorMiddleware.js";
 
@@ -19,6 +20,7 @@ app.get("/", (req, res) => {
 });
 
 app.use("/api/cars", carRoutes);
+app.use("/api/bookings", bookingRoutes);
 app.use("/api/auth", authRoutes);
 app.use(notFound);
 app.use(errorHandler);

@@ -52,14 +52,19 @@ const carSchema = new mongoose.Schema(
     },
     rating: {
       type: Number,
-      default: 0,
-      min: [0, "Rating cannot be below 0."],
+      // default: 0,
+      // min: [0, "Rating cannot be below 0."],
       max: [5, "Rating cannot exceed 5."],
     },
-    mileageType: {
-      type: String,
-      required: [true, "Mileage type is required."],
-      enum: ["Fixed", "Unlimited"],
+    // mileageType: {
+    //   type: String,
+    //   required: [true, "Mileage type is required."],
+    //   enum: ["Fixed", "Unlimited"],
+    // },
+    price: {
+      type: Number,
+      required: [true, "Price is required."],
+      min: [0, "Price cannot be negative."],
     },
     specifications: {
       engine: {
