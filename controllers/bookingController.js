@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import Booking from "../models/Booking.js";
 import Car from "../models/Car.js";
+import Notification from "../models/Notification.js";
 import User from "../models/User.js";
 import { sendBookingConfirmation } from "../utils/firebaseMessaging.js";
 
@@ -83,7 +84,23 @@ export const createBooking = async (req, res) => {
         car,
       });
       console.log("Booking notification accepted:", messageId);
-      notification = { sent: true };
+      notification = { sent: true, historySaved: true };
+      try {
+        await Notification.create({
+          user: req.userId,
+          title: "Booking successful",
+          body: `Your booking for ${car.name} is confirmed.`,
+          type: "booking_success",
+          data: {
+            bookingId: booking._id.toString(),
+            carId: car._id.toString(),
+            carName: car.name,
+          },
+        });
+      } catch (error) {
+        console.error("Failed to save booking notification history:", error);
+        notification.historySaved = false;
+      }
     } catch (error) {
       console.error(
         "Booking notification failed:",

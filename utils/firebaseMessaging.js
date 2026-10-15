@@ -41,3 +41,10 @@ export const sendBookingConfirmation = async ({ token, booking, car }) =>
       carName: car.name,
     },
   });
+
+export const sendPromotionalNotification = async ({ token, title, body }) =>
+  getMessaging(getFirebaseApp()).send({
+    token,
+    notification: { title, body },
+    data: { type: "promotional" },
+  });
