@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 import Booking from "../models/Booking.js";
 import Car from "../models/Car.js";
+import User from "../models/User.js";
+import { sendBookingConfirmation } from "../utils/firebaseMessaging.js";
 
 const badRequest = (message) => {
   const error = new Error(message);
@@ -56,6 +58,9 @@ export const createBooking = async (req, res) => {
     return res.status(404).json({ message: "Car not found." });
   }
 
+  const user = await User.findById(req.userId).select("+fcmToken");
+  console.log("Booking user:", req.userId);
+  console.log("FCM token found:", Boolean(user?.fcmToken));
   const booking = await Booking.create({
     user: req.userId,
     car: car._id,
@@ -66,9 +71,35 @@ export const createBooking = async (req, res) => {
 
   await populateBookingDetails(booking);
 
+  let notification = {
+    sent: false,
+    reason: "device_token_not_registered",
+  };
+  if (user?.fcmToken) {
+    try {
+      const messageId = await sendBookingConfirmation({
+        token: user.fcmToken,
+        booking,
+        car,
+      });
+      console.log("Booking notification accepted:", messageId);
+      notification = { sent: true };
+    } catch (error) {
+      console.error(
+        "Booking notification failed:",
+        error?.code,
+        error?.message,
+      );
+      notification = { sent: false, reason: "delivery_failed" };
+    }
+  } else {
+    console.log("No FCM token stored for booking user:", req.userId);
+  }
+
   res.status(201).json({
     message: "Booking created successfully.",
     booking,
+    notification,
   });
 };
 

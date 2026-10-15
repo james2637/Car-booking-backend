@@ -19,6 +19,10 @@ const userSchema = new mongoose.Schema(
       maxlength: [72, "Password cannot exceed 72 characters."],
       select: false,
     },
+    fcmToken: {
+      type: String,
+      select: false,
+    },
   },
   { timestamps: true },
 );
