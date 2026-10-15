@@ -7,6 +7,12 @@ const bookingSchema = new mongoose.Schema(
             ref: "User",
             required: true
         },
+        paymentOrder: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "PaymentOrder",
+            unique: true,
+            sparse: true,
+        },
         car: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Car",

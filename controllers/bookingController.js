@@ -1,9 +1,13 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import mongoose from "mongoose";
 import Booking from "../models/Booking.js";
 import Car from "../models/Car.js";
 import Notification from "../models/Notification.js";
+import PaymentOrder from "../models/PaymentOrder.js";
 import User from "../models/User.js";
 import { sendBookingConfirmation } from "../utils/firebaseMessaging.js";
+import { calculateBookingPrice } from "../utils/bookingPricing.js";
+import { getRazorpayClient } from "../utils/razorpay.js";
 
 const badRequest = (message) => {
   const error = new Error(message);
@@ -24,11 +28,8 @@ const populateBookingDetails = (query) =>
     { path: "car" },
   ]);
 
-export const createBooking = async (req, res) => {
-  const { carId, startDate, endDate, totalPrice } = req.body ?? {};
-
+const validateBookingDetails = async ({ carId, startDate, endDate }) => {
   const validatedCarId = validateObjectId(carId, "A valid carId is required.");
-
   if (
     typeof startDate !== "string" ||
     !startDate.trim() ||
@@ -50,71 +51,218 @@ export const createBooking = async (req, res) => {
     throw badRequest("endDate must be after startDate.");
   }
 
-  if (typeof totalPrice !== "number" || !Number.isFinite(totalPrice) || totalPrice < 0) {
-    throw badRequest("totalPrice must be a non-negative number.");
+  const car = await Car.findById(validatedCarId);
+  if (!car) {
+    return null;
   }
 
-  const car = await Car.findById(validatedCarId);
+  const pricing = calculateBookingPrice(car.price, parsedStartDate, parsedEndDate);
+  const { amount, rentalDays, totalPrice } = pricing;
+  if (!Number.isSafeInteger(amount) || amount < 100) {
+    throw badRequest("The calculated booking amount must be at least INR 1.");
+  }
+
+  return {
+    car,
+    startDate: parsedStartDate,
+    endDate: parsedEndDate,
+    rentalDays,
+    amount,
+    totalPrice,
+  };
+};
+
+export const createPaymentOrder = async (req, res) => {
+  const details = await validateBookingDetails(req.body ?? {});
+  if (!details) {
+    return res.status(404).json({ message: "Car not found." });
+  }
+
+  const paymentOrderId = new mongoose.Types.ObjectId();
+  const razorpayOrder = await getRazorpayClient().orders.create({
+    amount: details.amount,
+    currency: "INR",
+    receipt: paymentOrderId.toString(),
+    notes: {
+      userId: req.userId,
+      carId: details.car._id.toString(),
+    },
+  });
+
+  await PaymentOrder.create({
+    _id: paymentOrderId,
+    user: req.userId,
+    car: details.car._id,
+    startDate: details.startDate,
+    endDate: details.endDate,
+    totalPrice: details.totalPrice,
+    amount: details.amount,
+    currency: "INR",
+    razorpayOrderId: razorpayOrder.id,
+  });
+
+  res.status(201).json({
+    message: "Payment order created.",
+    order: {
+      id: razorpayOrder.id,
+      amount: details.amount,
+      currency: "INR",
+      keyId: process.env.RAZORPAY_KEY_ID,
+      rentalDays: details.rentalDays,
+      totalPrice: details.totalPrice,
+    },
+  });
+};
+
+const verifyPaymentSignature = ({ orderId, paymentId, signature }) => {
+  const secret = process.env.RAZORPAY_KEY_SECRET;
+  if (!secret) {
+    throw new Error("RAZORPAY_KEY_SECRET must be configured.");
+  }
+  if (typeof signature !== "string" || !/^[a-f0-9]{64}$/i.test(signature)) {
+    return false;
+  }
+
+  const expected = createHmac("sha256", secret)
+    .update(`${orderId}|${paymentId}`)
+    .digest();
+  const supplied = Buffer.from(signature, "hex");
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+};
+
+const sendBookingNotification = async ({ userId, booking, car }) => {
+  const user = await User.findById(userId).select("+fcmToken");
+  if (!user?.fcmToken) {
+    return { sent: false, reason: "device_token_not_registered" };
+  }
+
+  try {
+    await sendBookingConfirmation({ token: user.fcmToken, booking, car });
+  } catch (error) {
+    console.error("Booking notification failed:", error?.code, error?.message);
+    return { sent: false, reason: "delivery_failed" };
+  }
+
+  try {
+    await Notification.create({
+      user: userId,
+      title: "Booking successful",
+      body: `Your booking for ${car.name} is confirmed.`,
+      type: "booking_success",
+      data: {
+        bookingId: booking._id.toString(),
+        carId: car._id.toString(),
+        carName: car.name,
+      },
+    });
+    return { sent: true, historySaved: true };
+  } catch (error) {
+    console.error("Failed to save booking notification history:", error);
+    return { sent: true, historySaved: false };
+  }
+};
+
+export const verifyPaymentAndCreateBooking = async (req, res) => {
+  const { razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature } =
+    req.body ?? {};
+  if (
+    typeof orderId !== "string" ||
+    !orderId ||
+    typeof paymentId !== "string" ||
+    !paymentId
+  ) {
+    throw badRequest("Razorpay order and payment IDs are required.");
+  }
+  if (!verifyPaymentSignature({ orderId, paymentId, signature })) {
+    return res.status(400).json({ message: "Invalid Razorpay payment signature." });
+  }
+
+  const paymentOrder = await PaymentOrder.findOne({
+    razorpayOrderId: orderId,
+    user: req.userId,
+  });
+  if (!paymentOrder) {
+    return res.status(404).json({ message: "Payment order not found." });
+  }
+
+  if (paymentOrder.status === "paid") {
+    if (paymentOrder.razorpayPaymentId !== paymentId) {
+      return res.status(409).json({ message: "Payment order was already completed." });
+    }
+    const existingBooking = await populateBookingDetails(
+      Booking.findOne({ paymentOrder: paymentOrder._id }),
+    );
+    if (existingBooking) {
+      return res.json({
+        message: "Payment already verified and booking created.",
+        booking: existingBooking,
+      });
+    }
+  }
+
+  const razorpay = getRazorpayClient();
+  let payment = await razorpay.payments.fetch(paymentId);
+  if (
+    payment.order_id !== paymentOrder.razorpayOrderId ||
+    payment.amount !== paymentOrder.amount ||
+    payment.currency !== paymentOrder.currency
+  ) {
+    return res.status(400).json({ message: "Payment details do not match the order." });
+  }
+  if (payment.status === "authorized") {
+    payment = await razorpay.payments.capture(
+      paymentId,
+      paymentOrder.amount,
+      paymentOrder.currency,
+    );
+  }
+  if (payment.status !== "captured") {
+    return res.status(409).json({
+      message: "Payment has not been captured yet.",
+      paymentStatus: payment.status,
+    });
+  }
+
+  const car = await Car.findById(paymentOrder.car);
   if (!car) {
     return res.status(404).json({ message: "Car not found." });
   }
 
-  const user = await User.findById(req.userId).select("+fcmToken");
-  console.log("Booking user:", req.userId);
-  console.log("FCM token found:", Boolean(user?.fcmToken));
-  const booking = await Booking.create({
-    user: req.userId,
-    car: car._id,
-    startDate: parsedStartDate,
-    endDate: parsedEndDate,
-    totalPrice,
-  });
-
-  await populateBookingDetails(booking);
-
-  let notification = {
-    sent: false,
-    reason: "device_token_not_registered",
-  };
-  if (user?.fcmToken) {
+  let booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
+  if (!booking) {
     try {
-      const messageId = await sendBookingConfirmation({
-        token: user.fcmToken,
-        booking,
-        car,
+      booking = await Booking.create({
+        user: paymentOrder.user,
+        car: paymentOrder.car,
+        paymentOrder: paymentOrder._id,
+        startDate: paymentOrder.startDate,
+        endDate: paymentOrder.endDate,
+        totalPrice: paymentOrder.totalPrice,
       });
-      console.log("Booking notification accepted:", messageId);
-      notification = { sent: true, historySaved: true };
-      try {
-        await Notification.create({
-          user: req.userId,
-          title: "Booking successful",
-          body: `Your booking for ${car.name} is confirmed.`,
-          type: "booking_success",
-          data: {
-            bookingId: booking._id.toString(),
-            carId: car._id.toString(),
-            carName: car.name,
-          },
-        });
-      } catch (error) {
-        console.error("Failed to save booking notification history:", error);
-        notification.historySaved = false;
-      }
     } catch (error) {
-      console.error(
-        "Booking notification failed:",
-        error?.code,
-        error?.message,
-      );
-      notification = { sent: false, reason: "delivery_failed" };
+      if (error?.code !== 11000) {
+        throw error;
+      }
+      booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
+      if (!booking) {
+        throw error;
+      }
     }
-  } else {
-    console.log("No FCM token stored for booking user:", req.userId);
   }
 
+  paymentOrder.status = "paid";
+  paymentOrder.razorpayPaymentId = paymentId;
+  paymentOrder.booking = booking._id;
+  await paymentOrder.save();
+  await populateBookingDetails(booking);
+
+  const notification = await sendBookingNotification({
+    userId: paymentOrder.user,
+    booking,
+    car,
+  });
   res.status(201).json({
-    message: "Booking created successfully.",
+    message: "Payment verified and booking created successfully.",
     booking,
     notification,
   });
