@@ -46,9 +46,15 @@ const paymentOrderSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["pending", "paid"],
+      enum: ["pending", "paid", "refunded"],
       default: "pending",
       required: true,
+    },
+    expiresAt: {
+      type: Date,
+    },
+    razorpayRefundId: {
+      type: String,
     },
     booking: {
       type: mongoose.Schema.Types.ObjectId,
@@ -57,6 +63,8 @@ const paymentOrderSchema = new mongoose.Schema(
   },
   { timestamps: true },
 );
+
+paymentOrderSchema.index({ car: 1, status: 1, expiresAt: 1, startDate: 1, endDate: 1 });
 
 const PaymentOrder = mongoose.model("PaymentOrder", paymentOrderSchema);
 

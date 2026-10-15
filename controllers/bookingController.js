@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import mongoose from "mongoose";
 import Booking from "../models/Booking.js";
 import Car from "../models/Car.js";
@@ -12,6 +12,12 @@ import { getRazorpayClient } from "../utils/razorpay.js";
 const badRequest = (message) => {
   const error = new Error(message);
   error.statusCode = 400;
+  return error;
+};
+
+const conflict = (message) => {
+  const error = new Error(message);
+  error.statusCode = 409;
   return error;
 };
 
@@ -72,46 +78,129 @@ const validateBookingDetails = async ({ carId, startDate, endDate }) => {
   };
 };
 
+const withCarBookingLock = async (carId, operation) => {
+  const lockId = randomUUID();
+  const now = new Date();
+  const lockUntil = new Date(now.getTime() + 120_000);
+  const car = await Car.findOneAndUpdate(
+    {
+      _id: carId,
+      $or: [
+        { bookingLockUntil: { $exists: false } },
+        { bookingLockUntil: { $lte: now } },
+      ],
+    },
+    {
+      $set: {
+        bookingLockId: lockId,
+        bookingLockUntil: lockUntil,
+      },
+    },
+    { returnDocument: "after" },
+  ).select("+bookingLockId");
+
+  if (!car) {
+    throw conflict("This car is currently being booked. Please try again.");
+  }
+
+  try {
+    return await operation(car);
+  } finally {
+    await Car.updateOne(
+      { _id: carId, bookingLockId: lockId },
+      { $unset: { bookingLockId: 1, bookingLockUntil: 1 } },
+    );
+  }
+};
+
+const assertCarAvailable = async ({
+  carId,
+  startDate,
+  endDate,
+  excludePaymentOrderId,
+}) => {
+  const overlap = {
+    car: carId,
+    startDate: { $lt: endDate },
+    endDate: { $gt: startDate },
+  };
+  const pendingFilter = {
+    ...overlap,
+    status: "pending",
+    expiresAt: { $gt: new Date() },
+  };
+  if (excludePaymentOrderId) {
+    pendingFilter._id = { $ne: excludePaymentOrderId };
+    overlap.paymentOrder = { $ne: excludePaymentOrderId };
+  }
+
+  const [existingBooking, pendingOrder] = await Promise.all([
+    Booking.exists(overlap),
+    PaymentOrder.exists(pendingFilter),
+  ]);
+  if (existingBooking || pendingOrder) {
+    throw conflict("This car is already booked or reserved for the selected dates.");
+  }
+};
+
 export const createPaymentOrder = async (req, res) => {
   const details = await validateBookingDetails(req.body ?? {});
   if (!details) {
     return res.status(404).json({ message: "Car not found." });
   }
 
-  const paymentOrderId = new mongoose.Types.ObjectId();
-  const razorpayOrder = await getRazorpayClient().orders.create({
-    amount: details.amount,
-    currency: "INR",
-    receipt: paymentOrderId.toString(),
-    notes: {
-      userId: req.userId,
-      carId: details.car._id.toString(),
-    },
-  });
+  const order = await withCarBookingLock(details.car._id, async (car) => {
+    await assertCarAvailable({
+      carId: car._id,
+      startDate: details.startDate,
+      endDate: details.endDate,
+    });
 
-  await PaymentOrder.create({
-    _id: paymentOrderId,
-    user: req.userId,
-    car: details.car._id,
-    startDate: details.startDate,
-    endDate: details.endDate,
-    totalPrice: details.totalPrice,
-    amount: details.amount,
-    currency: "INR",
-    razorpayOrderId: razorpayOrder.id,
-  });
+    const pricing = calculateBookingPrice(
+      car.price,
+      details.startDate,
+      details.endDate,
+    );
+    if (!Number.isSafeInteger(pricing.amount) || pricing.amount < 100) {
+      throw badRequest("The calculated booking amount must be at least INR 1.");
+    }
 
-  res.status(201).json({
-    message: "Payment order created.",
-    order: {
+    const paymentOrderId = new mongoose.Types.ObjectId();
+    const expiresAt = new Date(Date.now() + 30_000);
+    const razorpayOrder = await getRazorpayClient().orders.create({
+      amount: pricing.amount,
+      currency: "INR",
+      receipt: paymentOrderId.toString(),
+      notes: {
+        userId: req.userId,
+        carId: car._id.toString(),
+      },
+    });
+
+    await PaymentOrder.create({
+      _id: paymentOrderId,
+      user: req.userId,
+      car: car._id,
+      startDate: details.startDate,
+      endDate: details.endDate,
+      totalPrice: pricing.totalPrice,
+      amount: pricing.amount,
+      currency: "INR",
+      razorpayOrderId: razorpayOrder.id,
+      expiresAt,
+    });
+
+    return {
       id: razorpayOrder.id,
-      amount: details.amount,
+      amount: pricing.amount,
       currency: "INR",
       keyId: process.env.RAZORPAY_KEY_ID,
-      rentalDays: details.rentalDays,
-      totalPrice: details.totalPrice,
-    },
+      rentalDays: pricing.rentalDays,
+      totalPrice: pricing.totalPrice,
+    };
   });
+
+  res.status(201).json({ message: "Payment order created.", order });
 };
 
 const verifyPaymentSignature = ({ orderId, paymentId, signature }) => {
@@ -199,9 +288,15 @@ export const verifyPaymentAndCreateBooking = async (req, res) => {
       });
     }
   }
+  if (paymentOrder.status === "refunded") {
+    return res.status(409).json({
+      message: "This payment was refunded and cannot be used to create a booking.",
+      refundId: paymentOrder.razorpayRefundId,
+    });
+  }
 
   const razorpay = getRazorpayClient();
-  let payment = await razorpay.payments.fetch(paymentId);
+  const payment = await razorpay.payments.fetch(paymentId);
   if (
     payment.order_id !== paymentOrder.razorpayOrderId ||
     payment.amount !== paymentOrder.amount ||
@@ -209,53 +304,149 @@ export const verifyPaymentAndCreateBooking = async (req, res) => {
   ) {
     return res.status(400).json({ message: "Payment details do not match the order." });
   }
-  if (payment.status === "authorized") {
-    payment = await razorpay.payments.capture(
-      paymentId,
-      paymentOrder.amount,
-      paymentOrder.currency,
-    );
-  }
-  if (payment.status !== "captured") {
+  if (!["authorized", "captured"].includes(payment.status)) {
     return res.status(409).json({
       message: "Payment has not been captured yet.",
       paymentStatus: payment.status,
     });
   }
 
-  const car = await Car.findById(paymentOrder.car);
-  if (!car) {
-    return res.status(404).json({ message: "Car not found." });
-  }
-
-  let booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
-  if (!booking) {
-    try {
-      booking = await Booking.create({
-        user: paymentOrder.user,
-        car: paymentOrder.car,
-        paymentOrder: paymentOrder._id,
-        startDate: paymentOrder.startDate,
-        endDate: paymentOrder.endDate,
-        totalPrice: paymentOrder.totalPrice,
-      });
-    } catch (error) {
-      if (error?.code !== 11000) {
-        throw error;
-      }
-      booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
-      if (!booking) {
-        throw error;
+  const result = await withCarBookingLock(paymentOrder.car, async (car) => {
+    const currentPaymentOrder = await PaymentOrder.findById(paymentOrder._id);
+    if (currentPaymentOrder?.status === "paid") {
+      const existingBooking = await populateBookingDetails(
+        Booking.findOne({ paymentOrder: currentPaymentOrder._id }),
+      );
+      if (existingBooking) {
+        return { alreadyCompleted: true, booking: existingBooking };
       }
     }
+    if (currentPaymentOrder?.status === "refunded") {
+      return {
+        alreadyRefunded: true,
+        refundId: currentPaymentOrder.razorpayRefundId,
+      };
+    }
+
+    try {
+      await assertCarAvailable({
+        carId: paymentOrder.car,
+        startDate: paymentOrder.startDate,
+        endDate: paymentOrder.endDate,
+        excludePaymentOrderId: paymentOrder._id,
+      });
+    } catch (error) {
+      if (error.statusCode !== 409) {
+        throw error;
+      }
+
+      if (payment.status === "captured") {
+        let refund;
+        try {
+          refund = await razorpay.payments.refund(paymentId, {
+            amount: paymentOrder.amount,
+          });
+        } catch (refundError) {
+          console.error(
+            "Failed to refund payment for unavailable car:",
+            refundError?.error?.code,
+            refundError?.message,
+          );
+          const failure = new Error(
+            "The car is no longer available and payment refund could not be initiated. Contact support.",
+          );
+          failure.statusCode = 502;
+          throw failure;
+        }
+
+        paymentOrder.status = "refunded";
+        paymentOrder.razorpayPaymentId = paymentId;
+        paymentOrder.razorpayRefundId = refund.id;
+        await paymentOrder.save();
+        return {
+          conflict: true,
+          refunded: true,
+          refundId: refund.id,
+        };
+      }
+
+      return { conflict: true, refunded: false };
+    }
+
+    let capturedPayment = payment;
+    if (payment.status === "authorized") {
+      capturedPayment = await razorpay.payments.capture(
+        paymentId,
+        paymentOrder.amount,
+        paymentOrder.currency,
+      );
+    }
+    if (capturedPayment.status !== "captured") {
+      return {
+        paymentNotCaptured: true,
+        paymentStatus: capturedPayment.status,
+      };
+    }
+
+    let booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
+    if (!booking) {
+      try {
+        booking = await Booking.create({
+          user: paymentOrder.user,
+          car: paymentOrder.car,
+          paymentOrder: paymentOrder._id,
+          startDate: paymentOrder.startDate,
+          endDate: paymentOrder.endDate,
+          totalPrice: paymentOrder.totalPrice,
+        });
+      } catch (error) {
+        if (error?.code !== 11000) {
+          throw error;
+        }
+        booking = await Booking.findOne({ paymentOrder: paymentOrder._id });
+        if (!booking) {
+          throw error;
+        }
+      }
+    }
+
+    paymentOrder.status = "paid";
+    paymentOrder.razorpayPaymentId = paymentId;
+    paymentOrder.booking = booking._id;
+    await paymentOrder.save();
+    await populateBookingDetails(booking);
+    return { booking, car };
+  });
+
+  if (result.alreadyCompleted) {
+    return res.json({
+      message: "Payment already verified and booking created.",
+      booking: result.booking,
+    });
+  }
+  if (result.alreadyRefunded) {
+    return res.status(409).json({
+      message: "This payment was refunded and cannot be used to create a booking.",
+      refundId: result.refundId,
+    });
+  }
+  if (result.conflict) {
+    return res.status(409).json({
+      message: result.refunded
+        ? "The car was booked by another customer. Your payment refund was initiated."
+        : "The car was booked by another customer. Payment was not captured.",
+      refunded: result.refunded,
+      refundId: result.refundId,
+    });
+  }
+  if (result.paymentNotCaptured) {
+    return res.status(409).json({
+      message: "Payment has not been captured yet.",
+      paymentStatus: result.paymentStatus,
+    });
   }
 
-  paymentOrder.status = "paid";
-  paymentOrder.razorpayPaymentId = paymentId;
-  paymentOrder.booking = booking._id;
-  await paymentOrder.save();
-  await populateBookingDetails(booking);
-
+  const { booking, car } = result;
   const notification = await sendBookingNotification({
     userId: paymentOrder.user,
     booking,
@@ -265,6 +456,60 @@ export const verifyPaymentAndCreateBooking = async (req, res) => {
     message: "Payment verified and booking created successfully.",
     booking,
     notification,
+  });
+};
+
+export const getUserPaymentHistory = async (req, res) => {
+  const rawPage = req.query.page ?? "1";
+  const rawLimit = req.query.limit ?? "20";
+  const page = Number(rawPage);
+  const limit = Number(rawLimit);
+
+  if (
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+    throw badRequest("page must be a positive integer and limit must be between 1 and 100.");
+  }
+
+  const filter = { user: req.userId };
+  const [paymentOrders, total] = await Promise.all([
+    PaymentOrder.find(filter)
+      .select(
+        "totalPrice currency razorpayOrderId razorpayPaymentId startDate endDate car booking status createdAt updatedAt",
+      )
+      .populate({ path: "car", select: "name brand" })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    PaymentOrder.countDocuments(filter),
+  ]);
+
+  res.json({
+    payments: paymentOrders.map((paymentOrder) => ({
+      id: paymentOrder._id,
+      totalPrice: paymentOrder.totalPrice,
+      currency: paymentOrder.currency,
+      status: paymentOrder.status,
+      razorpayOrderId: paymentOrder.razorpayOrderId,
+      razorpayPaymentId: paymentOrder.razorpayPaymentId,
+      startDate: paymentOrder.startDate,
+      endDate: paymentOrder.endDate,
+      car: paymentOrder.car,
+      bookingId: paymentOrder.booking,
+      expiresAt: paymentOrder.expiresAt,
+      updatedAt: paymentOrder.updatedAt,
+    })),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
   });
 };
 

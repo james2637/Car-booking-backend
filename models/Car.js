@@ -66,6 +66,14 @@ const carSchema = new mongoose.Schema(
       required: [true, "Price is required."],
       min: [0, "Price cannot be negative."],
     },
+    bookingLockId: {
+      type: String,
+      select: false,
+    },
+    bookingLockUntil: {
+      type: Date,
+      select: false,
+    },
     specifications: {
       engine: {
         type: String,
