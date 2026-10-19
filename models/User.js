@@ -23,6 +23,12 @@ const userSchema = new mongoose.Schema(
       type: String,
       select: false,
     },
+    wishlist: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Car",
+      },
+    ],
   },
   { timestamps: true },
 );

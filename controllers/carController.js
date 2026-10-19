@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import Car from "../models/Car.js";
+import User from "../models/User.js";
 import { deleteCarImages, uploadCarImages } from "../utils/cloudinaryImages.js";
 
 const parseSpecifications = (value) => {
@@ -77,6 +78,55 @@ export const getCarById = async (req, res) => {
   }
 
   res.json({ car });
+};
+
+export const addCarToWishlist = async (req, res) => {
+  validateCarId(req.params.id);
+  const car = await Car.findById(req.params.id);
+
+  if (!car) {
+    return res.status(404).json({ message: "Car not found." });
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.userId,
+    { $addToSet: { wishlist: car._id } },
+    { new: true },
+  );
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found." });
+  }
+
+  res.json({ message: "Car added to wishlist.", car });
+};
+
+export const getWishlist = async (req, res) => {
+  const user = await User.findById(req.userId).populate("wishlist");
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found." });
+  }
+
+  res.json({ cars: user.wishlist.filter(Boolean) });
+};
+
+export const removeCarFromWishlist = async (req, res) => {
+  validateCarId(req.params.id);
+  const user = await User.findByIdAndUpdate(
+    req.userId,
+    { $pull: { wishlist: req.params.id } },
+    { new: true },
+  );
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found." });
+  }
+
+  res.json({
+    message: "Car removed from wishlist.",
+    carId: req.params.id,
+  });
 };
 
 export const updateCar = async (req, res) => {
