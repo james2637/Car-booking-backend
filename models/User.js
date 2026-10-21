@@ -3,10 +3,15 @@ import mongoose from "mongoose";
 
 const userSchema = new mongoose.Schema(
   {
+    name: {
+      type: String,
+      trim: true,
+      maxlength: [100, "Name cannot exceed 100 characters."],
+    },
     email: {
       type: String,
-      required: [true, "Email is required."],
       unique: true,
+      sparse: true,
       lowercase: true,
       trim: true,
       maxlength: [254, "Email cannot exceed 254 characters."],
@@ -14,10 +19,15 @@ const userSchema = new mongoose.Schema(
     },
     password: {
       type: String,
-      required: [true, "Password is required."],
       minlength: [6, "Password must be at least 6 characters."],
       maxlength: [72, "Password cannot exceed 72 characters."],
       select: false,
+    },
+    phone: {
+      type: String,
+      unique: true,
+      sparse: true,
+      match: [/^\d{8,15}$/, "Enter a valid phone number."],
     },
     fcmToken: {
       type: String,
@@ -32,6 +42,12 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true },
 );
+
+userSchema.pre("validate", function validateLoginMethod() {
+  if ((!this.email || !this.password) && !this.phone) {
+    this.invalidate("phone", "A phone number or an email and password are required.");
+  }
+});
 
 userSchema.pre("save", async function hashPassword() {
   if (this.isModified("password")) {

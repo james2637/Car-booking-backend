@@ -16,7 +16,7 @@ export const errorHandler = (error, req, res, next) => {
     statusCode = 400;
   } else if (error.code === 11000) {
     statusCode = 409;
-    message = "An account with this email already exists.";
+    message = "An account with this email or phone already exists.";
   } else if (error.name === "MulterError") {
     statusCode = 400;
     message =
